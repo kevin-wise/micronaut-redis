@@ -38,10 +38,12 @@ import io.micronaut.context.annotation.EachBean;
 import io.micronaut.context.annotation.Requires;
 import io.micronaut.context.exceptions.ConfigurationException;
 import io.micronaut.core.annotation.NonNull;
+import io.micronaut.core.annotation.Nullable;
 import io.micronaut.core.convert.ConversionService;
 import io.micronaut.core.convert.exceptions.ConversionErrorException;
 import io.micronaut.core.serialize.JdkSerializer;
 import io.micronaut.core.serialize.ObjectSerializer;
+import io.micronaut.core.serialize.exceptions.SerializationException;
 import io.micronaut.core.type.Argument;
 import io.micronaut.core.util.CollectionUtils;
 
@@ -75,6 +77,8 @@ public class RedisCache implements SyncCache<StatefulConnection<?, ?>>, AutoClos
     private final Long expireAfterAccess;
     private final RedisAsyncCache asyncCache;
     private final StatefulConnection<byte[], byte[]> connection;
+    private final StatefulRedisConnection<byte[], byte[]> statefulRedisConnection;
+    private final StatefulRedisClusterConnection<byte[], byte[]> statefulRedisClusterConnection;
     private final RedisKeyCommands<byte[], byte[]> redisKeyCommands;
     private final RedisStringCommands<byte[], byte[]> redisStringCommands;
     private final RedisKeyAsyncCommands<byte[], byte[]> redisKeyAsyncCommands;
@@ -137,17 +141,21 @@ public class RedisCache implements SyncCache<StatefulConnection<?, ?>>, AutoClos
         this.asyncCache = new RedisAsyncCache();
 
         if (connection instanceof StatefulRedisConnection) {
-            RedisCommands<byte[], byte[]> sync = ((StatefulRedisConnection<byte[], byte[]>) connection).sync();
+            statefulRedisConnection = (StatefulRedisConnection<byte[], byte[]>) connection;
+            statefulRedisClusterConnection = null;
+            RedisCommands<byte[], byte[]> sync = statefulRedisConnection.sync();
             redisStringCommands = sync;
             redisKeyCommands = sync;
-            RedisAsyncCommands<byte[], byte[]> async = ((StatefulRedisConnection<byte[], byte[]>) connection).async();
+            RedisAsyncCommands<byte[], byte[]> async = statefulRedisConnection.async();
             redisKeyAsyncCommands = async;
             redisStringAsyncCommands = async;
         } else if (connection instanceof StatefulRedisClusterConnection) {
-            RedisAdvancedClusterCommands<byte[], byte[]> sync = ((StatefulRedisClusterConnection<byte[], byte[]>) connection).sync();
+            statefulRedisConnection = null;
+            statefulRedisClusterConnection = (StatefulRedisClusterConnection<byte[], byte[]>) connection;
+            RedisAdvancedClusterCommands<byte[], byte[]> sync = statefulRedisClusterConnection.sync();
             redisStringCommands = sync;
             redisKeyCommands = sync;
-            RedisAdvancedClusterAsyncCommands<byte[], byte[]> async = ((StatefulRedisClusterConnection<byte[], byte[]>) connection).async();
+            RedisAdvancedClusterAsyncCommands<byte[], byte[]> async = statefulRedisClusterConnection.async();
             redisKeyAsyncCommands = async;
             redisStringAsyncCommands = async;
         } else {
@@ -194,6 +202,39 @@ public class RedisCache implements SyncCache<StatefulConnection<?, ?>>, AutoClos
         return connection;
     }
 
+    /**
+     * @return The Redis server connection, if there is one.
+     * @throws IllegalStateException If the connection is to a Redis cluster, not a server.
+     */
+    @NonNull
+    public StatefulRedisConnection<byte[], byte[]> getStatefulRedisConnection() {
+        if (statefulRedisConnection != null) {
+            return statefulRedisConnection;
+        } else {
+            throw new IllegalStateException("Redis connection is to a cluster, not a server");
+        }
+    }
+
+    /**
+     * @return The Redis cluster connection, if there is one.
+     * @throws IllegalStateException If the connection is to a Redis server, not a cluster.
+     */
+    @NonNull
+    public StatefulRedisClusterConnection<byte[], byte[]> getStatefulRedisClusterConnection() {
+        if (statefulRedisClusterConnection != null) {
+            return statefulRedisClusterConnection;
+        } else {
+            throw new IllegalStateException("Redis connection is to a server, not a cluster");
+        }
+    }
+
+    /**
+     * @return Whether the connection is to a cluster (true) or server (false).
+     */
+    public boolean isCluster() {
+        return statefulRedisClusterConnection != null;
+    }
+
     @Override
     public <T> Optional<T> get(Object key, Argument<T> requiredType) {
         byte[] serializedKey = serializeKey(key);
@@ -205,7 +246,7 @@ public class RedisCache implements SyncCache<StatefulConnection<?, ?>>, AutoClos
         byte[] serializedKey = serializeKey(key);
         byte[] data = redisStringCommands.get(serializedKey);
         if (data != null) {
-            Optional<T> deserialized = valueSerializer.deserialize(data, requiredType);
+            Optional<T> deserialized = deserializeValue(data, requiredType);
             if (deserialized.isPresent()) {
                 return deserialized.get();
             }
@@ -259,7 +300,7 @@ public class RedisCache implements SyncCache<StatefulConnection<?, ?>>, AutoClos
             for (KeyValue<byte[], byte[]> result : data) {
                 K originalKey = serializedKeyMap.get(result.getKey());
                 if (result.hasValue()) {
-                    final T deserialized = valueSerializer.deserialize(result.getValue(), requiredType)
+                    final T deserialized = deserializeValue(result.getValue(), requiredType)
                         .orElseThrow(() ->
                             new ConversionErrorException(requiredType,
                                 new IllegalArgumentException("Cannot convert cached value for [" + originalKey + "] to target type: " + requiredType.getType() + ". Considering defining a TypeConverter bean to handle this case.")));
@@ -319,7 +360,7 @@ public class RedisCache implements SyncCache<StatefulConnection<?, ?>>, AutoClos
             List<byte[]> toDelete = new ArrayList<>(values.size());
             values.forEach((key, value) -> {
                 byte[] serializedKey = serializeKey(key);
-                Optional<byte[]> serialized = valueSerializer.serialize(value);
+                Optional<byte[]> serialized = serializeValue(value);
                 if (serialized.isPresent()) {
                     toSave.put(serializedKey, serialized.get());
                     if (toExpire != null) {
@@ -385,7 +426,7 @@ public class RedisCache implements SyncCache<StatefulConnection<?, ?>>, AutoClos
             redisKeyCommands.pexpire(serializedKey, expireAfterAccess);
         }
         if (data != null) {
-            return valueSerializer.deserialize(data, requiredType);
+            return deserializeValue(data, requiredType);
         } else {
             return Optional.empty();
         }
@@ -406,7 +447,7 @@ public class RedisCache implements SyncCache<StatefulConnection<?, ?>>, AutoClos
      * @param <T>           type of the value
      */
     protected <T> void putValue(byte[] serializedKey, T value) {
-        Optional<byte[]> serialized = valueSerializer.serialize(value);
+        Optional<byte[]> serialized = serializeValue(value);
         if (serialized.isPresent()) {
             byte[] bytes = serialized.get();
             if (expireAfterWritePolicy != null) {
@@ -420,13 +461,63 @@ public class RedisCache implements SyncCache<StatefulConnection<?, ?>>, AutoClos
     }
 
     /**
-     * Serialize the key.
+     * Serialize the key the way this cache does. See {@link ObjectSerializer#serialize(Object)}.
      *
-     * @param key The key
+     * @param key The key to serialize
      * @return bytes of the object
+     * @throws SerializationException   If there is a serialization problem
+     * @throws IllegalArgumentException If the key is null
      */
-    protected byte[] serializeKey(Object key) {
-        return keySerializer.serialize(key).orElseThrow(() -> new IllegalArgumentException("Key cannot be null"));
+    @NonNull
+    public byte[] serializeKey(@NonNull Object key) {
+        return keySerializer.serialize(key)
+            .orElseThrow(() -> new IllegalArgumentException("Key cannot be null"));
+    }
+
+    /**
+     * Serialize the value the way this cache does. See {@link ObjectSerializer#serialize(Object)}.
+     *
+     * @param value The object to serialize
+     * @return An optional of the bytes of the object
+     * @throws SerializationException if there is a serialization problem
+     */
+    @NonNull
+    public Optional<byte[]> serializeValue(@Nullable Object value) {
+        return valueSerializer.serialize(value);
+    }
+
+    /**
+     * Deserialize the value the way this cache does. See {@link ObjectSerializer#deserialize(byte[],
+     * Argument)}.
+     *
+     * @param value        The serialized value from the cache
+     * @param requiredType The required type
+     * @param <T>          The required generic type
+     * @return An {@link Optional} of the object
+     * @throws SerializationException if there is a deserialization problem
+     */
+    @NonNull
+    public <T> Optional<T> deserializeValue(@Nullable byte[] value, @NonNull Argument<T> requiredType) {
+        return valueSerializer.deserialize(value, requiredType);
+    }
+
+    /**
+     * @param value Object that will be put in the cache (non-serialized)
+     * @return TTL of the value in milliseconds, or null if the value should have no TTL
+     */
+    @NonNull
+    public Optional<Long> getExpirationAfterWrite(@Nullable Object value) {
+        return expireAfterWritePolicy == null ? Optional.empty()
+            : Optional.of(expireAfterWritePolicy.getExpirationAfterWrite(value));
+    }
+
+    /**
+     * @return The configured {@link RedisCacheConfiguration#getExpireAfterWrite()} value for this
+     * cache, in milliseconds.
+     */
+    @NonNull
+    public Optional<Long> getExpireAfterAccess() {
+        return Optional.ofNullable(expireAfterAccess);
     }
 
     private DefaultStringKeySerializer newDefaultKeySerializer(RedisCacheConfiguration redisCacheConfiguration, ConversionService<?> conversionService) {
@@ -460,7 +551,7 @@ public class RedisCache implements SyncCache<StatefulConnection<?, ?>>, AutoClos
             byte[] serializedKey = serializeKey(key);
             return redisStringAsyncCommands.get(serializedKey).thenCompose(data -> {
                 if (data != null) {
-                    Optional<T> deserialized = valueSerializer.deserialize(data, requiredType);
+                    Optional<T> deserialized = deserializeValue(data, requiredType);
                     boolean hasValue = deserialized.isPresent();
                     if (expireAfterAccess != null && hasValue) {
                         return redisKeyAsyncCommands.expire(serializedKey, expireAfterAccess).thenApply(ignore -> deserialized.get());
@@ -479,7 +570,7 @@ public class RedisCache implements SyncCache<StatefulConnection<?, ?>>, AutoClos
                 if (data != null) {
                     return getWithExpire(Argument.of((Class<T>) value.getClass()), serializedKey, data);
                 }
-                Optional<byte[]> serialized = valueSerializer.serialize(value);
+                Optional<byte[]> serialized = serializeValue(value);
                 if (serialized.isPresent()) {
                     return putWithExpire(serializedKey, serialized.get(), value).thenApply(ignore -> Optional.of(value));
                 }
@@ -490,7 +581,7 @@ public class RedisCache implements SyncCache<StatefulConnection<?, ?>>, AutoClos
         @Override
         public CompletableFuture<Boolean> put(Object key, Object value) {
             byte[] serializedKey = serializeKey(key);
-            Optional<byte[]> serialized = valueSerializer.serialize(value);
+            Optional<byte[]> serialized = serializeValue(value);
             if (serialized.isPresent()) {
                 return putWithExpire(serializedKey, serialized.get(), value).toCompletableFuture();
             }
@@ -526,7 +617,7 @@ public class RedisCache implements SyncCache<StatefulConnection<?, ?>>, AutoClos
         }
 
         private <T> CompletionStage<Optional<T>> getWithExpire(Argument<T> requiredType, byte[] serializedKey, byte[] data) {
-            Optional<T> deserialized = valueSerializer.deserialize(data, requiredType);
+            Optional<T> deserialized = deserializeValue(data, requiredType);
             if (expireAfterAccess != null && deserialized.isPresent()) {
                 return redisKeyAsyncCommands.expire(serializedKey, expireAfterAccess)
                         .thenApply(ignore -> deserialized);
@@ -537,7 +628,7 @@ public class RedisCache implements SyncCache<StatefulConnection<?, ?>>, AutoClos
         private <T> CompletionStage<T> putFromSupplier(byte[] serializedKey, Supplier<T> supplier) {
             return supply(supplier)
                     .thenCompose(value -> {
-                        Optional<byte[]> serialized = valueSerializer.serialize(value);
+                        Optional<byte[]> serialized = serializeValue(value);
                         if (serialized.isPresent()) {
                             return putWithExpire(serializedKey, serialized.get(), value).thenApply(ignore -> value);
                         }
