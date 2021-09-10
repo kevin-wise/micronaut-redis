@@ -141,6 +141,9 @@ public class RedisCache extends AbstractRedisCache<StatefulConnection<byte[], by
                           new ConversionErrorException(requiredType,
                               new IllegalArgumentException("Cannot convert cached value for [" + originalKey + "] to target type: " + requiredType.getType() + ". Considering defining a TypeConverter bean to handle this case.")));
                   results.put(originalKey, deserialized);
+                  if (expireAfterAccess != null) {
+                      redisKeyCommands.pexpire(result.getKey(), expireAfterAccess);
+                  }
                 } else {
                   results.put(originalKey, null);
                 }
@@ -230,27 +233,30 @@ public class RedisCache extends AbstractRedisCache<StatefulConnection<byte[], by
 
     public void put(Map<?, ?> values) {
         if (CollectionUtils.isNotEmpty(values)) {
-            if (expireAfterWritePolicy != null) {
-                values.forEach(this::put);
-            } else {
-                Map<byte[], byte[]> toSave = new HashMap<>(values.size());
-                List<byte[]> toDelete = new ArrayList<>();
-                values.forEach((key, value) -> {
-                    byte[] serializedKey = serializeKey(key);
-                    Optional<byte[]> serialized = valueSerializer.serialize(value);
-                    if (serialized.isPresent()) {
-                        toSave.put(serializedKey, serialized.get());
-                    } else {
-                        toDelete.add(serializedKey);
+            Map<byte[], byte[]> toSave = new HashMap<>(values.size());
+            Map<byte[], Long> toExpire = expireAfterWritePolicy != null ? new HashMap<>(values.size()) : null;
+            List<byte[]> toDelete = new ArrayList<>();
+            values.forEach((key, value) -> {
+                byte[] serializedKey = serializeKey(key);
+                Optional<byte[]> serialized = valueSerializer.serialize(value);
+                if (serialized.isPresent()) {
+                    toSave.put(serializedKey, serialized.get());
+                    if (toExpire != null) {
+                        toExpire.put(serializedKey, expireAfterWritePolicy.getExpirationAfterWrite(value));
                     }
-                });
+                } else {
+                    toDelete.add(serializedKey);
+                }
+            });
 
-                if (CollectionUtils.isNotEmpty(toSave)) {
-                    redisStringCommands.mset(toSave);
+            if (CollectionUtils.isNotEmpty(toSave)) {
+                redisStringCommands.mset(toSave);
+                if (toExpire != null) {
+                    toExpire.forEach(redisKeyCommands::pexpire);
                 }
-                if (CollectionUtils.isNotEmpty(toDelete)) {
-                    redisKeyCommands.del(toDelete.toArray(new byte[toDelete.size()][]));
-                }
+            }
+            if (CollectionUtils.isNotEmpty(toDelete)) {
+                redisKeyCommands.del(toDelete.toArray(new byte[toDelete.size()][]));
             }
         }
     }
