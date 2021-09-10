@@ -30,6 +30,9 @@ import io.micronaut.context.annotation.EachBean;
 import io.micronaut.context.annotation.Requires;
 import io.micronaut.core.annotation.NonNull;
 import io.micronaut.core.convert.ConversionService;
+import io.micronaut.core.convert.exceptions.ConversionErrorException;
+import io.micronaut.core.serialize.JdkSerializer;
+import io.micronaut.core.serialize.ObjectSerializer;
 import io.micronaut.core.type.Argument;
 import io.micronaut.core.util.CollectionUtils;
 import io.micronaut.core.util.StringUtils;
@@ -112,6 +115,10 @@ public class RedisCache extends AbstractRedisCache<StatefulConnection<byte[], by
         return get(serializedKey, requiredType, supplier, redisStringCommands);
     }
 
+    public <K> Map<K, Object> get(Collection<K> keys) {
+      return get(keys, Argument.of(Object.class));
+    }
+
     public <K, T> Map<K, T> get(Collection<K> keys, Argument<T> requiredType) {
         Map<byte[], K> serializedKeyMap = new HashMap<>(keys.size());
         byte[][] serializedKeys = new byte[keys.size()][];
@@ -128,8 +135,15 @@ public class RedisCache extends AbstractRedisCache<StatefulConnection<byte[], by
             results = new LinkedHashMap<>(data.size());
             for (KeyValue<byte[], byte[]> result: data) {
                 K originalKey = serializedKeyMap.get(result.getKey());
-                T deserialized = valueSerializer.deserialize(result.getValue(), requiredType).orElse(null);
-                results.put(originalKey, deserialized);
+                if (result.hasValue()) {
+                  final T deserialized = valueSerializer.deserialize(result.getValue(), requiredType)
+                      .orElseThrow(() ->
+                          new ConversionErrorException(requiredType,
+                              new IllegalArgumentException("Cannot convert cached value for [" + originalKey + "] to target type: " + requiredType.getType() + ". Considering defining a TypeConverter bean to handle this case.")));
+                  results.put(originalKey, deserialized);
+                } else {
+                  results.put(originalKey, null);
+                }
             }
         } else {
             results = new LinkedHashMap<>();
