@@ -15,6 +15,7 @@
  */
 package io.micronaut.configuration.lettuce.cache;
 
+import io.lettuce.core.KeyValue;
 import io.lettuce.core.api.StatefulConnection;
 import io.lettuce.core.api.async.RedisKeyAsyncCommands;
 import io.lettuce.core.api.async.RedisStringAsyncCommands;
@@ -30,9 +31,17 @@ import io.micronaut.context.annotation.Requires;
 import io.micronaut.core.annotation.NonNull;
 import io.micronaut.core.convert.ConversionService;
 import io.micronaut.core.type.Argument;
+import io.micronaut.core.util.CollectionUtils;
 import io.micronaut.core.util.StringUtils;
 import jakarta.annotation.PreDestroy;
 
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.stream.Collectors;
+import javax.annotation.PreDestroy;
+import java.time.Duration;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
@@ -103,10 +112,34 @@ public class RedisCache extends AbstractRedisCache<StatefulConnection<byte[], by
         return get(serializedKey, requiredType, supplier, redisStringCommands);
     }
 
+    public <K, T> Map<K, T> get(Collection<K> keys, Argument<T> requiredType) {
+        Map<byte[], K> serializedKeyMap = keys.stream()
+            .collect(Collectors.toMap(this::serializeKey, Function.identity()));
+        byte[][] serializedKeys = serializedKeyMap.keySet().toArray(new byte[serializedKeyMap.size()][]);
+
+        List<KeyValue<byte[], byte[]>> data = redisStringCommands.mget(serializedKeys);
+        Map<K, T> results = new HashMap<>();
+
+        if (data != null) {
+            for (KeyValue<byte[], byte[]> result: data) {
+                T deserialized = valueSerializer.deserialize(result.getValue(), requiredType).orElse(null);
+                K originalKey = serializedKeyMap.get(result.getKey());
+                results.put(originalKey, deserialized);
+            }
+        }
+
+        return results;
+    }
+
     @Override
     public void invalidate(Object key) {
         byte[] serializedKey = serializeKey(key);
         redisKeyCommands.del(serializedKey);
+    }
+
+    public void invalidate(Collection<?> keys) {
+        byte[][] serializedKeys = keys.stream().map(this::serializeKey).toArray(byte[][]::new);
+        redisKeyCommands.del(serializedKeys);
     }
 
     @Override
@@ -172,6 +205,33 @@ public class RedisCache extends AbstractRedisCache<StatefulConnection<byte[], by
     @SuppressWarnings("java:S1185") // This is here for binary compatibility
     public void put(Object key, Object value) {
         super.put(key, value);
+    }
+
+    public void put(Map<?, ?> values) {
+        if (CollectionUtils.isNotEmpty(values)) {
+            if (expireAfterWritePolicy != null) {
+                values.forEach(this::put);
+            } else {
+                Map<byte[], byte[]> toSave = new HashMap<>(values.size());
+                List<byte[]> toDelete = new ArrayList<>();
+                values.forEach((key, value) -> {
+                    byte[] serializedKey = serializeKey(key);
+                    Optional<byte[]> serialized = valueSerializer.serialize(value);
+                    if (serialized.isPresent()) {
+                        toSave.put(serializedKey, serialized.get());
+                    } else {
+                        toDelete.add(serializedKey);
+                    }
+                });
+
+                if (CollectionUtils.isNotEmpty(toSave)) {
+                    redisStringCommands.mset(toSave);
+                }
+                if (CollectionUtils.isNotEmpty(toDelete)) {
+                    redisKeyCommands.del(toDelete.toArray(new byte[toDelete.size()][]));
+                }
+            }
+        }
     }
 
     @Override
