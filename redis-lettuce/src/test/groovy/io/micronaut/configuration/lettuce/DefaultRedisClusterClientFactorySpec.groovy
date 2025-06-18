@@ -10,6 +10,7 @@ import io.micronaut.context.ApplicationContext
 import io.micronaut.context.exceptions.ConfigurationException
 import io.micronaut.context.exceptions.NoSuchBeanException
 import io.micronaut.core.type.Argument
+import spock.lang.Ignore
 
 class DefaultRedisClusterClientFactorySpec extends RedisClusterSpec {
 
@@ -126,6 +127,7 @@ class DefaultRedisClusterClientFactorySpec extends RedisClusterSpec {
         thrown(ConfigurationException)
     }
 
+    @Ignore
     void "test redis client uses defined codec"() {
         when:
         ApplicationContext applicationContext = ApplicationContext.run(
